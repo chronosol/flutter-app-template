@@ -30,6 +30,45 @@ jobs:
 
       # ── FAST PRE-VALIDATION (catches errors in seconds, not minutes) ────
 
+      - name: Lint pubspec.yaml
+        run: |
+          echo "Checking pubspec.yaml for common generation errors..."
+          FAILED=0
+
+          # Check for leaked template literals
+          if grep -qE '\$\{|\.replace\(|\.toLowerCase\(' pubspec.yaml; then
+            echo "❌ pubspec.yaml contains unresolved template expressions."
+            echo "   The LLM output a JS template literal instead of the actual value."
+            grep -nE '\$\{|\.replace\(|\.toLowerCase\(' pubspec.yaml
+            FAILED=1
+          fi
+
+          # Check name field is valid snake_case
+          NAME=$(grep -E '^name:' pubspec.yaml | head -1 | awk '{print $2}' | tr -d '"' | tr -d "'")
+          if echo "$NAME" | grep -qE '[^a-z0-9_]'; then
+            echo "❌ pubspec.yaml 'name' field is not valid snake_case: $NAME"
+            FAILED=1
+          else
+            echo "✅ name: $NAME"
+          fi
+
+          # Check description is quoted
+          DESC_LINE=$(grep -E '^description:' pubspec.yaml | head -1)
+          if echo "$DESC_LINE" | grep -qE '^description: "'; then
+            echo "✅ description is quoted."
+          else
+            echo "❌ pubspec.yaml description is not wrapped in double quotes."
+            echo "   Found: $DESC_LINE"
+            FAILED=1
+          fi
+
+          if [ $FAILED -ne 0 ]; then
+            echo ""
+            cat pubspec.yaml
+            exit 1
+          fi
+          echo "✅ pubspec.yaml lint passed."
+
       - name: Validate pubspec.yaml SDK constraint
         run: |
           echo "Checking pubspec.yaml has a valid SDK lower bound..."
