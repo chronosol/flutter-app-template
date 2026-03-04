@@ -30,6 +30,20 @@ jobs:
 
       # ── FAST PRE-VALIDATION (catches errors in seconds, not minutes) ────
 
+      - name: Validate pubspec.yaml SDK constraint
+        run: |
+          echo "Checking pubspec.yaml has a valid SDK lower bound..."
+          SDK_LINE=$(grep -E '^\s+sdk:' pubspec.yaml | head -1)
+          echo "Found: $SDK_LINE"
+          if echo "$SDK_LINE" | grep -qE ">=\s*[0-9]"; then
+            echo "✅ SDK constraint has lower bound."
+          else
+            echo "❌ pubspec.yaml is missing a lower-bound SDK constraint."
+            echo "   Add this under 'environment:':"
+            echo "     sdk: '>=3.3.0 <4.0.0'"
+            exit 1
+          fi
+
       - name: Check for phantom imports
         run: |
           echo "Scanning for imports referencing non-existent files..."
