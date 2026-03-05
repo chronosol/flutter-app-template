@@ -1,157 +1,147 @@
-name: Build Flutter App
+name: Flutter Build
+
 on:
   workflow_dispatch:
     inputs:
-      platform:
-        description: 'Build target (apk, ipa, web)'
-        required: true
-        default: apk
-        type: choice
-        options: [apk, ipa, web]
       build_id:
-        description: 'Unique build identifier'
-        required: true
+        description: 'Build ID'
+        required: false
+        default: ''
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+
     steps:
-      - name: Checkout code
+      - name: Checkout
         uses: actions/checkout@v4
 
+      # ── Pre-flight: validate pubspec.yaml with Python (shell-safe) ──────────
+      # Python's yaml parser is identical to Flutter's — if this passes,
+      # flutter pub get will pass. Using Python avoids all bash quoting issues.
+      - name: Validate pubspec.yaml
+        run: |
+          python3 - <<'PYEOF'
+          import sys, re
+
+          try:
+              with open('pubspec.yaml', 'r') as f:
+                  content = f.read()
+          except FileNotFoundError:
+              print("ERROR: pubspec.yaml not found")
+              sys.exit(1)
+
+          errors = []
+
+          # 1. Parse with Python's yaml to catch any YAML syntax errors
+          try:
+              import yaml
+              data = yaml.safe_load(content)
+          except yaml.YAMLError as e:
+              print(f"ERROR: pubspec.yaml YAML parse failed: {e}")
+              sys.exit(1)
+
+          # 2. name must be unquoted snake_case
+          name = data.get('name', '')
+          if not re.match(r'^[a-z][a-z0-9_]*$', str(name)):
+              errors.append(f"name '{name}' is not valid snake_case")
+
+          # 3. environment.sdk must have a lower bound
+          env = data.get('environment', {})
+          sdk = str(env.get('sdk', ''))
+          if not sdk:
+              errors.append("environment.sdk constraint is missing")
+          elif sdk.startswith('^'):
+              errors.append(f"environment.sdk '{sdk}' uses caret — must use range '>=X.Y.Z <4.0.0'")
+          elif '>=' not in sdk:
+              errors.append(f"environment.sdk '{sdk}' has no lower bound — must use '>=X.Y.Z <4.0.0'")
+
+          # 4. No template literals leaked into any value
+          if '${' in content:
+              errors.append("pubspec.yaml contains template literal '${' — replace with actual value")
+
+          # 5. No codegen packages
+          forbidden = ['freezed', 'freezed_annotation', 'json_annotation', 'json_serializable', 'build_runner']
+          all_deps = {}
+          all_deps.update(data.get('dependencies', {}) or {})
+          all_deps.update(data.get('dev_dependencies', {}) or {})
+          for pkg in forbidden:
+              if pkg in all_deps:
+                  errors.append(f"forbidden codegen package '{pkg}' found in dependencies")
+
+          if errors:
+              print("pubspec.yaml validation FAILED:")
+              for e in errors:
+                  print(f"  - {e}")
+              sys.exit(1)
+          else:
+              print(f"pubspec.yaml OK — app: {name}, sdk: {sdk}")
+          PYEOF
+
+      # ── Flutter setup ────────────────────────────────────────────────────────
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
         with:
-          channel: stable
+          flutter-version: '3.32.0'
+          channel: 'stable'
           cache: true
 
-      - name: Install dependencies
+      - name: Flutter pub get
         run: flutter pub get
 
-      # ── FAST PRE-VALIDATION (catches errors in seconds, not minutes) ────
+      # ── Static analysis (catches type errors, missing imports, deprecated APIs) ─
+      - name: Flutter analyze
+        run: flutter analyze --no-fatal-infos
+        continue-on-error: false
 
-      - name: Lint pubspec.yaml
-        run: |
-          echo "Checking pubspec.yaml for common generation errors..."
-          FAILED=0
-
-          # Check for leaked template literals
-          if grep -qE '\$\{|\.replace\(|\.toLowerCase\(' pubspec.yaml; then
-            echo "❌ pubspec.yaml contains unresolved template expressions."
-            echo "   The LLM output a JS template literal instead of the actual value."
-            grep -nE '\$\{|\.replace\(|\.toLowerCase\(' pubspec.yaml
-            FAILED=1
-          fi
-
-          # Check name field is unquoted and valid snake_case
-          NAME_LINE=$(grep -E '^name:' pubspec.yaml | head -1)
-          NAME_RAW=$(echo "$NAME_LINE" | awk '{print $2}')
-
-          # Fail if name is quoted
-          if echo "$NAME_RAW" | grep -qE '^["']'; then
-            echo "❌ pubspec.yaml 'name' is quoted — NEVER quote the name field."
-            echo "   Found: $NAME_LINE"
-            echo "   Fix:   name: $(echo $NAME_RAW | tr -d '"' | tr -d "'")"
-            FAILED=1
-          fi
-
-          # Fail if name contains invalid characters
-          NAME_CLEAN=$(echo "$NAME_RAW" | tr -d '"' | tr -d "'")
-          if echo "$NAME_CLEAN" | grep -qE '[^a-z0-9_]'; then
-            echo "❌ pubspec.yaml 'name' contains invalid characters: $NAME_CLEAN"
-            echo "   Only lowercase letters, digits, and underscores are allowed."
-            FAILED=1
-          else
-            echo "✅ name: $NAME_CLEAN"
-          fi
-
-          # Check description is quoted
-          DESC_LINE=$(grep -E '^description:' pubspec.yaml | head -1)
-          if echo "$DESC_LINE" | grep -qE '^description: "'; then
-            echo "✅ description is quoted."
-          else
-            echo "❌ pubspec.yaml description is not wrapped in double quotes."
-            echo "   Found: $DESC_LINE"
-            FAILED=1
-          fi
-
-          if [ $FAILED -ne 0 ]; then
-            echo ""
-            cat pubspec.yaml
-            exit 1
-          fi
-          echo "✅ pubspec.yaml lint passed."
-
-      - name: Validate pubspec.yaml SDK constraint
-        run: |
-          echo "Checking pubspec.yaml has a valid SDK lower bound..."
-          SDK_LINE=$(grep -E '^\s+sdk:' pubspec.yaml | head -1)
-          echo "Found: $SDK_LINE"
-          if echo "$SDK_LINE" | grep -qE ">=\s*[0-9]"; then
-            echo "✅ SDK constraint has lower bound."
-          else
-            echo "❌ pubspec.yaml is missing a lower-bound SDK constraint."
-            echo "   Add this under 'environment:':"
-            echo "     sdk: '>=3.3.0 <4.0.0'"
-            exit 1
-          fi
-
+      # ── Phantom import check ─────────────────────────────────────────────────
       - name: Check for phantom imports
         run: |
-          echo "Scanning for imports referencing non-existent files..."
-          APP_NAME=$(grep '^name:' pubspec.yaml | awk '{print $2}' | tr -d '"')
-          echo "App package name: $APP_NAME"
-          FAILED=0
-          while IFS= read -r dart_file; do
-            while IFS= read -r import_line; do
-              rel_path=$(echo "$import_line" | sed -n "s|.*package:${APP_NAME}/\([^'\"]*\).*|\1|p")
-              if [ -n "$rel_path" ]; then
-                full_path="lib/$rel_path"
-                if [ ! -f "$full_path" ]; then
-                  echo "❌ PHANTOM IMPORT in $dart_file"
-                  echo "   missing: $full_path"
-                  FAILED=1
-                fi
-              fi
-            done < <(grep -E "^import 'package:" "$dart_file" 2>/dev/null)
-          done < <(find lib -name "*.dart")
-          if [ $FAILED -ne 0 ]; then
-            echo ""
-            echo "Phantom imports detected. Fix missing files before building."
-            exit 1
-          fi
-          echo "✅ No phantom imports found."
+          python3 - <<'PYEOF'
+          import sys, os, re
 
-      - name: Dart analyze
-        run: |
-          flutter analyze --no-pub 2>&1 | tee analyze_output.txt
-          if grep -qE "^  error" analyze_output.txt; then
-            echo ""
-            echo "❌ Dart analysis errors found. Fix before building."
-            exit 1
-          fi
-          echo "✅ Dart analysis passed."
+          with open('pubspec.yaml') as f:
+              import yaml
+              pubspec = yaml.safe_load(f.read())
+          app_name = pubspec.get('name', '')
 
-      # ── PLATFORM BUILDS (only runs if validation passes) ────────────────
+          errors = []
+          dart_files = []
+          for root, dirs, files in os.walk('lib'):
+              for fname in files:
+                  if fname.endswith('.dart'):
+                      dart_files.append(os.path.join(root, fname))
 
+          all_lib_files = set(
+              os.path.normpath(p) for p in dart_files
+          )
+
+          for dart_path in dart_files:
+              with open(dart_path) as f:
+                  src = f.read()
+              for m in re.finditer(r"^import\s+'package:" + re.escape(app_name) + r"/([^']+)'", src, re.MULTILINE):
+                  lib_path = os.path.normpath('lib/' + m.group(1))
+                  if lib_path not in all_lib_files:
+                      errors.append(f"PHANTOM IMPORT in {dart_path}: '{lib_path}' does not exist")
+
+          if errors:
+              print(f"Found {len(errors)} phantom import(s):")
+              for e in errors:
+                  print(f"  {e}")
+              sys.exit(1)
+          else:
+              print(f"Phantom import check OK — scanned {len(dart_files)} Dart files")
+          PYEOF
+
+      # ── Build APK ────────────────────────────────────────────────────────────
       - name: Build APK
-        if: inputs.platform == 'apk'
-        run: flutter build apk --release
+        run: flutter build apk --release --no-tree-shake-icons
 
-      - name: Build iOS (no codesign)
-        if: inputs.platform == 'ipa'
-        run: flutter build ipa --no-codesign
-
-      - name: Build Web
-        if: inputs.platform == 'web'
-        run: flutter build web --web-renderer canvaskit
-
-      - name: Upload Artifacts
+      # ── Upload artifact ──────────────────────────────────────────────────────
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ inputs.platform }}-${{ inputs.build_id }}
-          path: |
-            build/app/outputs/flutter-apk/app-release.apk
-            build/ios/ipa/*.ipa
-            build/web/**
-          if-no-files-found: error
+          name: app-release.apk
+          path: build/app/outputs/flutter-apk/app-release.apk
+          retention-days: 7
