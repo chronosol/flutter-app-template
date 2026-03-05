@@ -43,13 +43,26 @@ jobs:
             FAILED=1
           fi
 
-          # Check name field is valid snake_case
-          NAME=$(grep -E '^name:' pubspec.yaml | head -1 | awk '{print $2}' | tr -d '"' | tr -d "'")
-          if echo "$NAME" | grep -qE '[^a-z0-9_]'; then
-            echo "❌ pubspec.yaml 'name' field is not valid snake_case: $NAME"
+          # Check name field is unquoted and valid snake_case
+          NAME_LINE=$(grep -E '^name:' pubspec.yaml | head -1)
+          NAME_RAW=$(echo "$NAME_LINE" | awk '{print $2}')
+
+          # Fail if name is quoted
+          if echo "$NAME_RAW" | grep -qE '^["']'; then
+            echo "❌ pubspec.yaml 'name' is quoted — NEVER quote the name field."
+            echo "   Found: $NAME_LINE"
+            echo "   Fix:   name: $(echo $NAME_RAW | tr -d '"' | tr -d "'")"
+            FAILED=1
+          fi
+
+          # Fail if name contains invalid characters
+          NAME_CLEAN=$(echo "$NAME_RAW" | tr -d '"' | tr -d "'")
+          if echo "$NAME_CLEAN" | grep -qE '[^a-z0-9_]'; then
+            echo "❌ pubspec.yaml 'name' contains invalid characters: $NAME_CLEAN"
+            echo "   Only lowercase letters, digits, and underscores are allowed."
             FAILED=1
           else
-            echo "✅ name: $NAME"
+            echo "✅ name: $NAME_CLEAN"
           fi
 
           # Check description is quoted
